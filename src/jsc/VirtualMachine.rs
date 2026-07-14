@@ -1528,6 +1528,15 @@ impl VirtualMachine {
         // doing it causes like 50+ tests to break
         // self.event_loop().tick();
 
+        // Flush queued inspector messages so exit() doesn't kill the
+        // detached debugger thread mid-delivery. The debugger thread runs
+        // its own VirtualMachine (see debugger::start_js_debugger_thread),
+        // so this wait never contends with the main VM's API lock that
+        // callers of global_exit typically hold.
+        if self.debugger.is_some() {
+            crate::debugger::Debugger::drain();
+        }
+
         if self.should_destruct_main_thread_on_exit() {
             #[cfg(windows)]
             if let Some(t) = self.event_loop_mut().forever_timer.take() {
@@ -1804,8 +1813,19 @@ pub struct RuntimeHooks {
     /// live in `bun_runtime::test_runner` (forward-dep cycle), so the body is
     /// hoisted to the high tier; low-tier `Bun__TestReporterAgentEnable`
     /// dispatches here. No-op when `bun test` isn't running.
-    pub retroactively_report_discovered_tests:
-        unsafe fn(agent: *mut crate::debugger::TestReporterHandle),
+    /// `next_test_id` points at the calling `Debugger`'s
+    /// `next_test_id_for_debugger` field, shared with the live-collection ID
+    /// counter (`ScopeFunctions::call`) so the two paths don't hand out
+    /// colliding IDs when `TestReporter.enable` lands mid-collection.
+    ///
+    /// # Safety
+    /// `next_test_id` must be non-null and point at a live `i32` the callee
+    /// has exclusive access to for the duration of the call; it is used
+    /// synchronously only and must never be retained past the call returning.
+    pub retroactively_report_discovered_tests: unsafe fn(
+        agent: *mut crate::debugger::TestReporterHandle,
+        next_test_id: *mut i32,
+    ),
     /// Cancel every `TimeoutObject` / `ImmediateObject` still in the calling
     /// thread's `timer::All` heap so their JS pins and in-heap `+1` refs drop
     /// before the GC sweep. `timer::All` lives in `bun_runtime` (forward-dep);

@@ -1628,16 +1628,22 @@ pub(crate) fn close_isolation_handles(vm: &mut VirtualMachine) {
     }
 }
 
-/// `TestReporterAgent.retroactivelyReportDiscoveredTests(agent)`.
+/// `TestReporterAgent.retroactivelyReportDiscoveredTests(agent, next_test_id)`.
 /// When `TestReporter.enable` arrives after test
 /// collection has started, walk the already-discovered scope tree, assign
 /// debugger test IDs, and emit `reportTestFoundWithLocation` for each.
 ///
 /// # Safety
 /// `agent` is a live C++ `Inspector::TestReporterAgent::Handle*` (just stored
-/// into `debugger.test_reporter_agent.handle` by the caller). Called on the JS
-/// thread.
-unsafe fn retroactively_report_discovered_tests(agent: *mut bun_jsc::debugger::TestReporterHandle) {
+/// into `debugger.test_reporter_agent.handle` by the caller). `next_test_id`
+/// must be non-null and point at a live `i32` (the calling `Debugger`'s
+/// `next_test_id_for_debugger`) that this function has exclusive access to
+/// for the duration of the call; it is used synchronously only and not
+/// retained past the call returning. Called on the JS thread.
+unsafe fn retroactively_report_discovered_tests(
+    agent: *mut bun_jsc::debugger::TestReporterHandle,
+    next_test_id: *mut i32,
+) {
     use crate::test_runner::bun_test::{DescribeScope, Phase, TestScheduleEntry};
     use crate::test_runner::jest::Jest;
     use bun_jsc::debugger::{TestReporterHandle, TestType};
@@ -1663,21 +1669,22 @@ unsafe fn retroactively_report_discovered_tests(agent: *mut bun_jsc::debugger::T
         .text();
     let mut source_url = bun_core::String::init(file_path);
 
-    // Track the maximum ID we assign.
-    let mut max_id: i32 = 0;
+    // SAFETY: per fn contract above.
+    let max_id: &mut i32 = unsafe { &mut *next_test_id };
 
     // Recursively report all discovered tests starting from root scope.
+    // `max_id` is the shared `Debugger::next_test_id_for_debugger` counter
+    // (reborrowed here), not a local -- this is what keeps IDs from
+    // colliding with the live-collection path in `ScopeFunctions::call`,
+    // which increments the same field when `TestReporter.enable` lands
+    // mid-collection.
     retroactively_report_scope(
         agent,
         &mut active_file.collection.root_scope,
         -1,
-        &mut max_id,
+        &mut *max_id,
         &mut source_url,
     );
-
-    // A debug-only log of `max_id` was dropped here: `scoped_log!` only accepts
-    // an ident, so it can't name the scoped-logger static in `bun_jsc::debugger`.
-    let _ = max_id;
 
     fn retroactively_report_scope(
         agent: *mut TestReporterHandle,

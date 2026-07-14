@@ -3,6 +3,8 @@
 #include "ZigGlobalObject.h"
 
 #include <JavaScriptCore/InspectorFrontendChannel.h>
+#include <wtf/threads/BinarySemaphore.h>
+#include <memory>
 #include <JavaScriptCore/JSGlobalObjectDebuggable.h>
 #include <JavaScriptCore/JSGlobalObjectDebugger.h>
 #include <JavaScriptCore/Debugger.h>
@@ -45,6 +47,15 @@ static PausedWait& pausedWait()
     static PausedWait instance;
     return instance;
 }
+
+// Count of messages handed off from the inspected (main) thread to the
+// debugger thread via sendMessageToDebuggerThread() that haven't yet had
+// their corresponding onMessage/write() call invoked on the debugger thread.
+// Bun__debugger__drain() reads this only as an entry gate -- "is any handoff
+// still pending?" -- to decide whether to post its FIFO sentinel task; it
+// does NOT spin-wait for the count to reach zero (the sentinel's FIFO
+// ordering is what guarantees the handoff has caught up, not this counter).
+static std::atomic<uint64_t> totalPendingDebuggerMessages { 0 };
 
 static bool waitingForConnection = false;
 extern "C" void Debugger__didConnect();
@@ -359,9 +370,11 @@ public:
             this->debuggerThreadMessages.swap(messages);
         }
 
+        size_t messageCount = messages.size();
+
         JSFunction* onMessageFn = uncheckedDowncast<JSFunction>(jsBunDebuggerOnMessageFunction.get());
         MarkedArgumentBuffer arguments;
-        arguments.ensureCapacity(messages.size());
+        arguments.ensureCapacity(messageCount);
         auto& vm = debuggerGlobalObject->vm();
 
         for (auto& message : messages) {
@@ -371,6 +384,12 @@ public:
         messages.clear();
 
         JSC::call(debuggerGlobalObject, onMessageFn, arguments, "BunInspectorConnection::receiveMessagesOnDebuggerThread - onMessageFn"_s);
+
+        // After JSC::call, so onMessageFn (which calls into debugger.ts's
+        // webSocketWriter/bufferedWriter write()) has been invoked for every
+        // message in this batch. See Bun__debugger__drain().
+        if (messageCount > 0)
+            totalPendingDebuggerMessages.fetch_sub(messageCount, std::memory_order_release);
     }
 
     void sendMessageToDebuggerThread(WTF::String&& inputMessage)
@@ -378,6 +397,12 @@ public:
         {
             Locker<Lock> locker(debuggerThreadMessagesLock);
             debuggerThreadMessages.append(inputMessage);
+            // Incremented inside the same locked section as the append,
+            // before the lock is released. Incrementing after unlocking would
+            // race receiveMessagesOnDebuggerThread(), which could swap the
+            // vector out (and later decrement by the batch size) before this
+            // increment ran, undercounting totalPendingDebuggerMessages.
+            totalPendingDebuggerMessages.fetch_add(1, std::memory_order_release);
         }
 
         if (this->debuggerThreadMessageScheduledCount++ == 0) {
@@ -570,6 +595,106 @@ extern "C" void Bun__ensureDebugger(ScriptExecutionContextIdentifier scriptId, b
     if (pauseOnStart) {
         waitingForConnection = true;
     }
+}
+
+// Small ref-counted signal so a wait that times out doesn't leave a dangling
+// pointer for the debugger thread's already-posted task to dereference, and
+// so nothing is deliberately leaked (Bun's leak-sanitizer builds treat that
+// as a bug to fix -- see fba43af684, "Fix effectively every native-code
+// memory leak in Bun"). Both the waiting thread (Bun__debugger__drain) and
+// the posted task hold a reference via std::shared_ptr; whichever finishes
+// last frees it.
+struct DebuggerDrainSignal {
+    WTF::BinarySemaphore semaphore;
+};
+
+// Cap on how long the main thread waits, on exit, for the debugger thread to
+// finish the pending main->debugger-thread message handoff (layer a). A cap,
+// not a target: a wedged/starved debugger thread must never block process
+// exit indefinitely.
+static constexpr double kDrainHandoffTimeoutMs = 250;
+
+// Additional bounded grace period, taken on every debugger-attached exit, for
+// the debugger thread's own event loop to flush whatever it has already handed
+// to the socket layer out of that layer's send buffer and onto the wire
+// (layer b). Also a cap, not a target.
+static constexpr double kDrainFlushGraceMs = 150;
+
+// Called from the main (inspected) thread immediately before process exit
+// (see VirtualMachine::global_exit in VirtualMachine.rs). Blocks briefly so
+// the detached debugger thread isn't killed mid-delivery of queued inspector
+// protocol messages -- without this, exit() tears down the debugger thread
+// while messages are still queued or buffered, and the frontend misses the
+// final events (most visibly the last TestReporter.start/end events from
+// `bun test`, whose synchronous tests can queue right up to the same
+// event-loop iteration that falls through to exit()).
+//
+// This addresses two distinct layers of loss:
+//
+//   (a) The main->debugger-thread message handoff itself
+//       (sendMessageToDebuggerThread / receiveMessagesOnDebuggerThread).
+//       totalPendingDebuggerMessages tracks messages queued but not yet
+//       handed to onMessageFn; if any are pending we post a sentinel task and
+//       wait (capped) for it to run. Concurrent tasks on this context are
+//       FIFO, so once the sentinel runs, every receiveMessagesOnDebuggerThread
+//       invocation posted before this call has already invoked write() for
+//       every message it was holding.
+//
+//   (b) Whatever write() already handed to the socket layer may still be
+//       sitting in that layer's own send buffer rather than on the wire --
+//       e.g. ws.sendText() returning "backpressure" means the message was
+//       accepted but not yet flushed (see the tri-state fix in debugger.ts's
+//       webSocketWriter / bufferedWriter). That buffer only drains as the
+//       debugger thread's own event loop services socket writability, which
+//       keeps running independently of this (main) thread. This case is NOT
+//       captured by totalPendingDebuggerMessages -- the handoff counter can
+//       already be zero (write() was called, decrementing it) while bytes are
+//       still buffered below write(). So the layer-(b) grace wait runs
+//       whenever a debugger is attached, independent of the layer-(a) counter;
+//       gating it on the counter (as an earlier revision did) gave a message
+//       already sitting in the send buffer zero grace whenever there was no
+//       pending layer-(a) handoff. This intentionally adds a bounded
+//       (~kDrainFlushGraceMs) cost to every debugger-attached process exit.
+//
+// Both waits are capped so a wedged/starved debugger thread, or a consumer
+// that has stopped reading entirely, cannot block process exit indefinitely.
+// On timeout we simply degrade to pre-fix behavior for whatever hasn't been
+// delivered yet -- a truly non-reading consumer is inherently undeliverable
+// (a zero TCP/socket window can't be waited past), so timing out there is
+// correct, not a bug.
+extern "C" void Bun__debugger__drain()
+{
+    if (debuggerScriptExecutionContext == nullptr)
+        return;
+
+    // Layer (a): if a main->debugger-thread handoff is still pending, wait for
+    // it to catch up via a FIFO sentinel.
+    if (totalPendingDebuggerMessages.load(std::memory_order_acquire) != 0) {
+        auto signal = std::make_shared<DebuggerDrainSignal>();
+        debuggerScriptExecutionContext->postTaskConcurrently([signal](ScriptExecutionContext&) {
+            signal->semaphore.signal();
+        });
+        signal->semaphore.waitFor(WTF::Seconds::fromMilliseconds(kDrainHandoffTimeoutMs));
+    }
+
+    // Layer (b): give the debugger thread's own event loop a further bounded
+    // grace period to flush anything still sitting in the socket layer's send
+    // buffer to a normally-reading consumer (see debugger.ts's backpressure
+    // handling). Runs unconditionally here (a debugger is attached, per the
+    // null-context check above) because -- unlike layer (a) -- there is no
+    // main-thread-visible counter for "bytes still buffered below write()":
+    // the layer-(a) counter can already be zero while such bytes remain.
+    //
+    // This is a deliberately simple, unconditional wait rather than a poll of
+    // live buffer state: safely reading the debugger thread's JS-heap-owned
+    // writer state from this (main) thread would need new cross-thread
+    // synchronization whose surface area we judged not worth adding for a
+    // best-effort exit-time extension. Reusing BinarySemaphore purely for its
+    // timeout (nothing ever signals `topUp`) matches the existing
+    // wait-with-timeout-as-sleep idiom already used in this file (see
+    // pausedWait()'s `wait.condition.waitFor(wait.lock, Seconds(1))` above).
+    WTF::BinarySemaphore topUp;
+    topUp.waitFor(WTF::Seconds::fromMilliseconds(kDrainFlushGraceMs));
 }
 
 extern "C" void BunDebugger__willHotReload()

@@ -115,6 +115,15 @@ pub struct Debugger {
     pub mode: Mode,
 
     pub test_reporter_agent: TestReporterAgent,
+    /// Next ID to hand out for a `describe`/`test` reported to the
+    /// TestReporter frontend. Shared between the live-collection path
+    /// (`ScopeFunctions::call`, in `bun_runtime::test_runner`) and the
+    /// retroactive-reporting path (`retroactively_report_discovered_tests`,
+    /// dispatched through [`RuntimeHooks`](crate::virtual_machine::RuntimeHooks))
+    /// so the two don't hand out colliding IDs when `TestReporter.enable`
+    /// lands mid-collection (after some scopes are registered but before
+    /// their callbacks, which register further nested scopes, have run).
+    pub next_test_id_for_debugger: i32,
     pub lifecycle_reporter_agent: LifecycleAgent,
     /// Reached through a shared `&Debugger` borrow; the slot's `Cell` fields
     /// provide the interior mutability. JS-thread only.
@@ -135,6 +144,7 @@ impl Default for Debugger {
             set_breakpoint_on_first_line: false,
             mode: Mode::Listen,
             test_reporter_agent: TestReporterAgent::default(),
+            next_test_id_for_debugger: 0,
             lifecycle_reporter_agent: LifecycleAgent::default(),
             extension_agent: ErasedAgentSlot::default(),
             http_server_agent: HTTPServerAgent::default(),
@@ -156,6 +166,7 @@ unsafe extern "C" {
         from_env: c_int,
         is_connect: bool,
     );
+    safe fn Bun__debugger__drain();
 }
 
 static FUTEX_ATOMIC: AtomicU32 = AtomicU32::new(0);
@@ -339,6 +350,28 @@ impl Debugger {
                 Wait::Off => break,
             }
         }
+    }
+
+    /// Block (briefly, with a cap) until the debugger thread has written any
+    /// inspector protocol messages queued for it to the frontend socket, and
+    /// give it a further short grace period to flush anything still sitting
+    /// in the WebSocket layer's own send buffer to a still-reading consumer.
+    ///
+    /// Call this from the main thread immediately before process exit (see
+    /// [`VirtualMachine::global_exit`](crate::virtual_machine::VirtualMachine::global_exit))
+    /// so the detached debugger thread isn't killed mid-delivery. Without
+    /// this, `exit()` can tear down the debugger thread while the final
+    /// events of a run (e.g. `bun test`'s last `TestReporter.end` events)
+    /// are still queued or buffered, and the frontend never sees them.
+    ///
+    /// Both waits inside are capped, so a wedged debugger thread -- or a
+    /// frontend that has stopped reading entirely -- cannot block process
+    /// exit indefinitely. See `Bun__debugger__drain` in `BunDebugger.cpp`
+    /// for the full design (it covers two distinct loss layers: the
+    /// main-to-debugger-thread message handoff, and WebSocket-level
+    /// backpressure buffering).
+    pub fn drain() {
+        Bun__debugger__drain();
     }
 
     /// `Debugger.create(vm, global)` — first-time debugger setup: create the
@@ -799,8 +832,15 @@ pub fn test_reporter_agent_enable(agent: *mut TestReporterHandle) {
         // — a forward-dep cycle. Dispatched through [`RuntimeHooks`].
         if let Some(hooks) = runtime_hooks() {
             // SAFETY: `handle` is the live C++ agent just stored above.
+            // `next_test_id` points at `dbg.next_test_id_for_debugger`, which
+            // outlives this synchronous call and is exclusively accessed
+            // through this raw pointer only for the call's duration, per the
+            // hook's documented contract.
             unsafe {
-                (hooks.retroactively_report_discovered_tests)(dbg.test_reporter_agent.handle)
+                (hooks.retroactively_report_discovered_tests)(
+                    dbg.test_reporter_agent.handle,
+                    &mut dbg.next_test_id_for_debugger,
+                )
             };
         }
     }
