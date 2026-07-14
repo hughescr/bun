@@ -310,4 +310,91 @@ afterAll(async () => {
     const exitCode = await proc.exited;
     expect(exitCode).toBe(0);
   });
+
+  test("does not silently drop TestReporter events when the inspector socket experiences backpressure", async () => {
+    // Regression test for a bug where webSocketWriter() coerced ws.sendText()'s
+    // return value with `!!`. sendText() returns -1 (BACKPRESSURE), 0 (DROPPED),
+    // or a positive byte count (SUCCESS). The `!!` coercion collapsed -1 into
+    // `true`, making backpressure indistinguishable from success, so
+    // bufferedWriter() (which only requeues a message for retry when write()
+    // returns falsy) never retried or tracked messages that hit backpressure.
+    // Those messages were lost rather than delivered once the socket drained.
+    //
+    // To exercise the -1 branch for real we must genuinely fill the debugger
+    // WebSocket's send buffer past uWS's maxBackpressure threshold: pause our
+    // (listener-side) socket's reads before enabling the TestReporter agent,
+    // let the subprocess emit a large burst of `found`/`start`/`end` events
+    // and console messages while nothing drains the connection, then resume
+    // reading and confirm every emitted test is eventually reported.
+
+    const TEST_COUNT = 500;
+
+    const testFileLines = [`import { test, expect } from "bun:test";`];
+    for (let i = 0; i < TEST_COUNT; i++) {
+      // A sizeable console.log per test increases the bytes queued on the
+      // debugger socket while it is paused, helping push sendText() past
+      // uWS's backpressure threshold.
+      testFileLines.push(
+        `test("backpressure test ${i}", () => { console.log("x".repeat(2000)); expect(${i}).toBe(${i}); });`,
+      );
+    }
+
+    using dir = tempDir("test-reporter-backpressure", {
+      "backpressure.test.ts": testFileLines.join("\n"),
+    });
+
+    const socketPath = join(String(dir), `inspector-${Math.random().toString(36).substring(2)}.sock`);
+
+    const session = new TestReporterSession();
+    const framer = new SocketFramer((message: string) => {
+      session.onMessage(message);
+    });
+
+    const socketPromise = connect(`unix://${socketPath}`).then(s => {
+      socket = s;
+      session.socket = s;
+      session.framer = framer;
+      s.data = {
+        onData: framer.onData.bind(framer),
+      };
+      return s;
+    });
+
+    proc = spawn({
+      cmd: [bunExe(), `--inspect-wait=unix:${socketPath}`, "test", "--timeout", "30000", "backpressure.test.ts"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    await socketPromise;
+
+    // Pause reading on our side immediately, before the subprocess even starts
+    // emitting protocol messages, so its writes queue up and back-pressure.
+    socket!.pause();
+
+    session.enableInspector();
+    session.enableTestReporter();
+    session.send("Console.enable");
+    session.initialize();
+
+    // Give the subprocess time to run all tests and attempt to emit every
+    // found/start/end event and console message while our socket is paused
+    // and not draining anything.
+    await Bun.sleep(2000);
+
+    // Now resume reading. Any messages that were correctly retried/paced
+    // through bufferedWriter's backpressure handling should still arrive.
+    socket!.resume();
+
+    const foundTests = await session.waitForFoundTests(TEST_COUNT, 30000);
+    expect(foundTests.size).toBe(TEST_COUNT);
+
+    const endedTests = await session.waitForEndedTests(TEST_COUNT, 30000);
+    expect(endedTests.size).toBe(TEST_COUNT);
+
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(0);
+  });
 });

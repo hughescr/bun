@@ -538,7 +538,7 @@ function versionInfo(): unknown {
 
 function webSocketWriter(ws: ServerWebSocket<unknown>): Writer {
   return {
-    write: message => !!ws.sendText(message),
+    write: message => ws.sendText(message) !== 0,
     close: () => ws.close(),
   };
 }
